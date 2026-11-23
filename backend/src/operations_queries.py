@@ -32,7 +32,7 @@ FROM anomaly_events e JOIN display_cases c ON e.case_id=c.id ORDER BY e.created_
         '将每宗异常和对应文物巡检结果一一关联，找出缺少巡检证据的处置记录。',
         ['文物编号', '展柜', '异常号', '门开背景', '巡检项目', '巡检结果', '核验状态'],
         """
-SELECT c.artifact_code,c.code,e.id,e.door_context,k.check_type,k.result,
+SELECT COALESCE(e.artifact_code,c.artifact_code),c.code,e.id,e.door_context,k.check_type,k.result,
        CASE WHEN k.id IS NULL THEN '缺巡检记录' ELSE '证据已关联' END
 FROM anomaly_events e JOIN display_cases c ON e.case_id=c.id LEFT JOIN artifact_checks k ON k.event_id=e.id ORDER BY e.id DESC,k.id
 """,

@@ -16,7 +16,9 @@ SELECT e.id::text AS source_key,CONCAT(c.code,' · 告警 ',e.id) AS subject,
 FROM anomaly_events e JOIN display_cases c ON c.id=e.case_id
 LEFT JOIN LATERAL (
  SELECT sampled_at,temperature,humidity FROM environment_samples
- WHERE case_id=e.case_id AND sampled_at>e.resolved_at AND state='accepted' ORDER BY sampled_at LIMIT 1
+ WHERE case_id=e.case_id AND sampled_at>e.resolved_at AND state='accepted'
+   AND occupancy_id IS NOT DISTINCT FROM e.occupancy_id
+ ORDER BY sampled_at LIMIT 1
 ) s ON TRUE
 """,
     },

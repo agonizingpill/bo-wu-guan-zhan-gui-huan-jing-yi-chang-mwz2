@@ -2,6 +2,7 @@ import hashlib
 import os
 from datetime import datetime, timedelta, timezone
 
+from src.exhibit_handover import backfill_attribution, ensure_initial_occupancies
 from src.utils.db import execute, execute_returning, fetch_one, wait_for_db
 
 
@@ -91,6 +92,8 @@ def main():
         sample(cases['MC-04'], base + timedelta(minutes=index * 10), *values, False, '日常巡检基线')
 
     execute("UPDATE display_cases SET last_sample_at=(SELECT MAX(sampled_at) FROM environment_samples WHERE case_id=display_cases.id)")
+    ensure_initial_occupancies()
+    backfill_attribution()
     execute(
         '''INSERT INTO audit_logs (actor_id, action, entity_type, entity_id, detail)
            SELECT %s, 'seed_demo', 'batch', NULL, '{"source":"seed_demo","batch":"night-shift-2026-11-21"}'::jsonb

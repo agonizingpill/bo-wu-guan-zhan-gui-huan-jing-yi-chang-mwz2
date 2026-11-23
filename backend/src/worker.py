@@ -28,13 +28,26 @@ def main():
         if not item:
             continue
         _, payload = item
-        job = json.loads(payload)
-        run_id = int(job['run_id'])
         try:
-            execute("UPDATE algorithm_runs SET status='running', updated_at=NOW() WHERE id=%s", (run_id,))
-            run_case_analysis(int(job['case_id']), run_id)
+            job = json.loads(payload)
+            run_id = int(job['run_id'])
+            case_id = int(job['case_id'])
+        except Exception:
+            continue
+        try:
+            # 任务在排队时已快照展品占用区间；即使此刻展柜已换展品，仍按原展品评分。
+            claimed = execute(
+                "UPDATE algorithm_runs SET status='running', updated_at=NOW() WHERE id=%s AND status='queued'",
+                (run_id,),
+            )
+            if not claimed:
+                continue
+            run_case_analysis(case_id, run_id)
         except Exception as exc:
-            execute("UPDATE algorithm_runs SET status='failed', error=%s, updated_at=NOW() WHERE id=%s", (str(exc), run_id))
+            execute(
+                "UPDATE algorithm_runs SET status='failed', error=%s, updated_at=NOW() WHERE id=%s",
+                (str(exc), run_id),
+            )
 
 
 if __name__ == '__main__':

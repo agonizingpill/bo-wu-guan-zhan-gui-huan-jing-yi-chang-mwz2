@@ -76,6 +76,15 @@ async function loadData() {
     if (state.page === 'case' && !state.selectedCase && state.cases[0]) state.selectedCase = state.cases[0].id;
     if (state.page === 'anomalies' && !state.selectedEvent && state.anomalies[0]) state.selectedEvent = state.anomalies[0].id;
     renderContent();
+    if (state.page === 'case' && state.selectedCase) await loadCaseDetail(state.selectedCase);
+  } catch (error) { notify(error.message); }
+}
+
+async function loadCaseDetail(caseId) {
+  try {
+    const detail = await api(`/cases/${caseId}`);
+    state.cases = state.cases.map(c => c.id === caseId ? { ...c, ...detail } : c);
+    renderContent();
   } catch (error) { notify(error.message); }
 }
 
@@ -114,7 +123,25 @@ function inspectionsPage() {
   return `<div class="inspection-layout"><section class="panel inspection-intro"><p class="eyebrow">ARTIFACT CHECK / POST-INCIDENT</p><h2>巡检是异常闭环的最后一道门</h2><p>每一次环境异常都要留下文物状态证据。巡检通过后，主管才可以关闭异常。失败会把事件重新打开，并保留原因与操作者。</p><div class="inspection-mark">⊙</div></section><section class="panel inspection-table"><div class="panel-head"><div><p class="eyebrow">RECENT CHECKS</p><h2>最近巡检</h2></div><button class="text-button" data-page="anomalies">回到异常队列 →</button></div>${state.anomalies.map(e => `<div class="inspection-row"><span class="case-code">${esc(e.case_code)}</span><span><b>${esc(e.artifact_title)}</b><small>${label(e.anomaly_type)} · ${fmt(e.created_at)}</small></span><span class="result ${e.passed_checks ? 'pass' : 'pending'}">${e.passed_checks ? '已通过' : '待巡检'}</span><button class="text-button" data-event="${e.id}">打开 →</button></div>`).join('')}</section></div>`;
 }
 function casePage() { const current = state.cases.find(c => c.id === state.selectedCase) || state.cases[0]; return `<div class="case-layout"><section class="panel case-directory"><div class="panel-head"><div><p class="eyebrow">DISPLAY CASE REGISTER / 04</p><h2>展柜档案</h2></div><span class="filter-pill">${state.cases.length} 个在岗柜</span></div>${state.cases.map(c => `<button class="directory-item ${current?.id===c.id?'selected':''}" data-case="${c.id}"><span>${esc(c.code)}</span><b>${esc(c.artifact_title)}</b><small>${esc(c.zone)}</small></button>`).join('')}</section><section class="panel case-detail">${current ? caseDetail(current) : empty('没有展柜档案', '先创建一个在岗展柜。')}</section></div>`; }
-function caseDetail(c) { return `<div class="case-heading"><div><p class="eyebrow">${esc(c.gallery)} / ${esc(c.zone)}</p><h2>${esc(c.artifact_title)}</h2><span class="case-code">${esc(c.code)} · ${esc(c.artifact_code)}</span></div><span class="case-status">${label(c.status)}</span></div><div class="threshold-band"><div><small>温度窗口</small><b>${c.target_temp_min} — ${c.target_temp_max} °C</b></div><div><small>湿度窗口</small><b>${c.target_rh_min} — ${c.target_rh_max} %</b></div><div><small>门磁编号</small><b>${esc(c.door_sensor_id)}</b></div></div><div class="sample-table"><div class="table-title"><span>最近环境采样</span><small>${c.samples?.length || c.sample_count} 条记录</small></div>${(c.samples || []).slice(0,8).map(s => `<div class="sample-row"><span>${fmt(s.sampled_at)}</span><b>${s.temperature} °C</b><b>${s.humidity} %</b><b>${s.co2_ppm} ppm</b><span class="door-tag ${s.door_open?'open':''}">${s.door_open?'门开':'闭合'}</span></div>`).join('')}</div><button class="button primary" id="analyze-case" data-case-id="${c.id}">重新运行异常识别 ↗</button></div>`; }
+function caseDetail(c) {
+  const training = c.training || {};
+  const run = training.latest_run;
+  const occupancy = training.current_occupancy;
+  const runText = run
+    ? ({queued:'已排队', running:'评分中', succeeded:'评分完成', failed:'评分失败'}[run.status] || run.status)
+      + (run.status === 'succeeded' ? ` · ${run.metrics?.sample_count ?? '—'} 条入柜后样本` : '')
+      + (run.status === 'failed' && run.error ? ` · ${esc(run.error)}` : '')
+    : '尚无本次入柜后的评分';
+  const swapped = Boolean(occupancy && occupancy.exchange_id);
+  const trainingState = !training.ready
+    ? `<span class="training-badge gap">${swapped ? '换柜后训练样本不足' : '训练样本不足'}</span><small>${training.sample_count ?? 0} / ${training.required_samples ?? 6} 条有效采样，需补齐后才能建立基线</small>`
+    : run && run.status === 'failed'
+      ? `<span class="training-badge failed">评分失败</span><small>${esc(run.error || '')}</small>`
+      : run && run.status === 'succeeded'
+        ? `<span class="training-badge ready">评分完成</span><small>${runText}</small>`
+        : `<span class="training-badge ready">样本已足够</span><small>${run ? runText : '可发起本次入柜后的异常识别'}</small>`;
+  return `<div class="case-heading"><div><p class="eyebrow">${esc(c.gallery)} / ${esc(c.zone)}</p><h2>${esc(c.artifact_title)}</h2><span class="case-code">${esc(c.code)} · ${esc(c.artifact_code)}</span></div><span class="case-status">${label(c.status)}</span></div><div class="threshold-band"><div><small>温度窗口</small><b>${c.target_temp_min} — ${c.target_temp_max} °C</b></div><div><small>湿度窗口</small><b>${c.target_rh_min} — ${c.target_rh_max} %</b></div><div><small>门磁编号</small><b>${esc(c.door_sensor_id)}</b></div></div><div class="occupancy-band"><div><small>当前在柜展品</small><b>${occupancy ? esc(occupancy.artifact_code) + ' · ' + esc(occupancy.artifact_title) : '—'}</b><span>${occupancy ? '入柜 ' + fmt(occupancy.entered_at) : ''}</span></div><div class="training-state">${trainingState}</div></div><div class="sample-table"><div class="table-title"><span>最近环境采样</span><small>${c.samples?.length || c.sample_count} 条记录</small></div>${(c.samples || []).slice(0,8).map(s => `<div class="sample-row"><span>${fmt(s.sampled_at)}</span><b>${s.temperature} °C</b><b>${s.humidity} %</b><b>${s.co2_ppm} ppm</b><span class="door-tag ${s.door_open?'open':''}">${s.door_open?'门开':'闭合'}</span></div>`).join('')}</div><div class="case-actions"><button class="button primary" id="analyze-case" data-case-id="${c.id}">按本次入柜读数运行异常识别 ↗</button>${state.user?.role === 'supervisor' ? `<button class="button dark" id="handover-case" data-case-id="${c.id}">登记两柜展品交接 ⇄</button>` : ''}</div></div>`;
+}
 function empty(title, copy) { return `<div class="empty"><div>○</div><h3>${title}</h3><p>${copy}</p></div>`; }
 
 function bind() {
@@ -125,10 +152,63 @@ function bind() {
   bindPage();
 }
 function bindPage() {
-  document.querySelectorAll('[data-case]').forEach(button => button.addEventListener('click', async () => { state.selectedCase = Number(button.dataset.case); if (state.page === 'monitor') { state.page='case'; } render(); await loadData(); if (state.page === 'case') { const detail = await api(`/cases/${state.selectedCase}`); state.cases = state.cases.map(c => c.id===state.selectedCase ? {...c, ...detail} : c); renderContent(); } }));
+  document.querySelectorAll('[data-case]').forEach(button => button.addEventListener('click', async () => { state.selectedCase = Number(button.dataset.case); if (state.page === 'monitor') { state.page='case'; } render(); await loadData(); }));
   document.querySelectorAll('[data-event]').forEach(button => button.addEventListener('click', async () => { state.selectedEvent = Number(button.dataset.event); state.page='anomalies'; render(); await loadData(); }));
   document.querySelector('#analyze-case')?.addEventListener('click', async (event) => { try { const run = await api(`/analyze?case_id=${event.currentTarget.dataset.caseId}`, { method: 'POST' }); notify(`算法任务 #${run.id} 已入队，worker 正在处理`); pollRun(run.id); } catch (error) { notify(error.message); } });
+  document.querySelector('#handover-case')?.addEventListener('click', (event) => openHandover(Number(event.currentTarget.dataset.caseId)));
   document.querySelectorAll('[data-action]').forEach(button => button.addEventListener('click', () => handleAction(button.dataset.action)));
+}
+
+function localInputValue(date) {
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth()+1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function openHandover(caseId) {
+  const others = state.cases.filter(c => c.id !== caseId && c.status === 'active');
+  if (!others.length) { notify('没有其他在岗展柜可供对调'); return; }
+  const dialog = document.createElement('dialog');
+  dialog.id = 'handover-dialog';
+  // 重试凭据在本次登记内保持不变，网络重试不会重复登记。
+  const requestKey = `handover-${caseId}-${Date.now()}-${Math.random().toString(16).slice(2,10)}`;
+  dialog.innerHTML = `<form method="dialog">
+    <h2>登记两柜展品交接</h2>
+    <p class="eyebrow">EXHIBIT SWAP / 主管确认</p>
+    <label>对调展柜<select name="other" required>${others.map(c => `<option value="${c.id}">${esc(c.code)} · ${esc(c.artifact_title)}</option>`).join('')}</select></label>
+    <label>交接时间<input type="datetime-local" name="at" value="${localInputValue(new Date())}" required></label>
+    <label>交接说明<textarea name="note" maxlength="500" placeholder="记录交接原因、点交人与柜内状态"></textarea></label>
+    <p class="handover-note">交接后按交接时间重新划分两柜采样归属；已排队的评分仍按原展品完成，失败不会改动两柜现状。</p>
+    <p class="handover-error" role="status"></p>
+    <div class="handover-actions"><button type="button" data-close>取消</button><button type="submit" class="button dark">确认交接</button></div>
+  </form>`;
+  document.body.append(dialog);
+  const form = dialog.querySelector('form');
+  const error = dialog.querySelector('.handover-error');
+  dialog.querySelector('[data-close]').addEventListener('click', () => { dialog.close(); dialog.remove(); });
+  dialog.addEventListener('close', () => dialog.remove());
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const data = new FormData(form);
+    const button = form.querySelector('[type=submit]');
+    button.disabled = true;
+    error.textContent = '正在登记交接…';
+    try {
+      const result = await api('/exhibit-handovers', { method: 'POST', body: JSON.stringify({
+        case_a_id: caseId,
+        case_b_id: Number(data.get('other')),
+        handed_over_at: new Date(data.get('at')).toISOString(),
+        request_key: requestKey,
+        note: String(data.get('note') || ''),
+      })});
+      dialog.close();
+      notify(result.idempotent ? '该交接已登记，未重复记录' : `交接已登记，两柜按 ${fmt(result.exchange?.handed_over_at)} 重新划分采样归属`);
+      await loadData();
+    } catch (err) {
+      error.textContent = err.message;
+      button.disabled = false;
+    }
+  });
+  dialog.showModal();
 }
 async function pollRun(id) { for (let i=0;i<15;i++) { await new Promise(r => setTimeout(r, 1000)); const run = await api(`/runs/${id}`); if (run.status === 'succeeded') { notify(`异常识别完成，发现 ${run.metrics.outlier_count} 个候选事件`); await loadData(); return; } if (run.status === 'failed') { notify(run.error); return; } } }
 async function handleAction(action) { const e = state.anomalies.find(item => item.id === state.selectedEvent); if (!e) return; try { if (action === 'close') { await api(`/anomalies/${e.id}/close`, { method: 'POST' }); notify('异常已关闭'); } else if (action === 'inspect') { await api(`/anomalies/${e.id}/artifact-checks`, { method: 'POST', body: JSON.stringify({case_id:e.case_id,event_id:e.id,check_type:'post_incident',result:'pass',notes:'夜班巡检确认展柜玻璃、底座与文物状态正常'}) }); notify('文物巡检已记录为通过'); } else { const map = { door:'verify_door_sealed', adjust:'adjust_climate', curator:'call_curator' }; await api(`/anomalies/${e.id}/duty-actions`, { method:'POST', body: JSON.stringify({action_type:map[action], notes: action==='door'?'门已关闭，复采前完成门磁复核':'已按值守清单完成处置记录', status:'completed'}) }); notify('值守动作已写入审计'); } await loadData(); } catch (error) { notify(error.message); } }

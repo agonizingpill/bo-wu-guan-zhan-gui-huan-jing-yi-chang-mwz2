@@ -27,6 +27,8 @@
 - 没有已完成值守动作，或最近一次文物巡检不是 `pass`，主管不能关闭事件。
 - 同一展柜采样间隔超过 30 分钟会被拒绝，要求补齐缺测时段。
 - viewer 只能读取，operator 可录入采样和执行值守/巡检，supervisor 才能创建展柜和关闭异常。
+- 两件展品对调必须由主管确认交接时间；采样按交接时间归属到当时在柜的展品，异常识别只使用本次入柜后的读数。
+- 交接与评分并发时，已排队的评分仍固定到原展品；历史告警保留发生当时的展品快照。交接在单一事务中完成，失败时两柜保持原状，同一重试凭据不会重复登记。
 
 ## 快速启动
 
@@ -75,9 +77,11 @@ Compose 恰好包含 `frontend`、`backend`、`worker`、`db`、`redis` 五个�
 
 ## 算法口径
 
-输入为同一展柜按时间排序的 `[temperature_c, relative_humidity_pct, co2_ppm]`。worker 先使用 `RobustScaler` 按中位数和四分位距变换，再用 `IsolationForest(n_estimators=160, contamination=0.22, random_state=1069)` 输出 `decision_function` 分数和离群标签。低于 22% 分位阈值的样本形成异常候选。
+输入为同一展柜、同一件在柜展品、本次入柜后的 `[temperature_c, relative_humidity_pct, co2_ppm]`。worker 先使用 `RobustScaler` 按中位数和四分位距变换，再用 `IsolationForest(n_estimators=160, contamination=0.22, random_state=1069)` 输出 `decision_function` 分数和离群标签。低于 22% 分位阈值的样本形成异常候选。算法任务在排队时快照当时的展品占用区间，交接后已排队的任务仍按原展品评分。
 
-门开采样只改变业务分类为门开干扰。连续异常计数由时间序列中的连续离群样本计算，达到 3 个时升级。少于 6 条有效采样时算法任务失败并把错误写入 `algorithm_runs.error`，便于重试。
+换柜后的展品从交接时间起重新累计采样；不足 6 条时评分失败并提示补齐，展柜页面会显示「换柜后训练样本不足」或「评分完成」。
+
+门开采样只改变业务分类为门开干扰。连续异常计数由时间序列中的连续离群样本计算，达到 3 个时升级。本次入柜后的有效采样少于 6 条时算法任务失败并把错误写入 `algorithm_runs.error`，便于补齐后重试。
 
 ## 枚举出现位置
 

@@ -7,13 +7,16 @@ RECONCILIATION_VIEWS = {
         ['展柜', '采样来源', '前次采样', '当前采样', '实际间隔 分', '核查建议'],
         """
 WITH ordered AS (
-    SELECT case_id,source,sampled_at,LAG(sampled_at) OVER (PARTITION BY case_id ORDER BY sampled_at) AS previous_at
+    SELECT case_id,source,sampled_at,occupancy_id,
+           LAG(sampled_at) OVER (PARTITION BY case_id ORDER BY sampled_at) AS previous_at,
+           LAG(occupancy_id) OVER (PARTITION BY case_id ORDER BY sampled_at) AS previous_occupancy
     FROM environment_samples WHERE state='accepted'
 )
 SELECT c.code,o.source,o.previous_at,o.sampled_at,
        ROUND(EXTRACT(EPOCH FROM (o.sampled_at-o.previous_at))/60,1) AS gap_minutes,
        CASE WHEN o.sampled_at IS NULL THEN '无有效采样'
             WHEN o.previous_at IS NULL THEN '首个有效采样'
+            WHEN o.occupancy_id IS DISTINCT FROM o.previous_occupancy THEN '换柜后重新起算'
             WHEN o.sampled_at-o.previous_at>INTERVAL '30 minutes' THEN '超过 30 分钟，核对缺测'
             ELSE '采样间隔合规' END
 FROM display_cases c LEFT JOIN ordered o ON o.case_id=c.id
@@ -34,6 +37,7 @@ SELECT c.code,e.id,e.status,e.resolved_at,s.sampled_at,s.temperature,s.humidity,
 FROM anomaly_events e JOIN display_cases c ON c.id=e.case_id
 LEFT JOIN LATERAL (SELECT o.sampled_at,o.temperature,o.humidity FROM environment_samples o
                    WHERE o.case_id=e.case_id AND o.state='accepted' AND o.sampled_at>e.resolved_at
+                     AND o.occupancy_id IS NOT DISTINCT FROM e.occupancy_id
                    ORDER BY o.sampled_at LIMIT 1) s ON TRUE
 ORDER BY e.created_at DESC,e.id
 """,

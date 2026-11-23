@@ -10,6 +10,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from . import exhibit_handover
 from .casework_routes import router as operational_cases
 from .operations_evidence import router as operations_evidence
 from src.config.settings import REDIS_URL
@@ -65,6 +66,14 @@ class ArtifactCheckPayload(BaseModel):
     notes: str = Field(min_length=2)
 
 
+class HandoverPayload(BaseModel):
+    case_a_id: int
+    case_b_id: int
+    handed_over_at: datetime
+    request_key: str | None = Field(default=None, max_length=120)
+    note: str = Field(default='', max_length=500)
+
+
 @app.middleware('http')
 async def request_middleware(request: Request, call_next):
     started = time.monotonic()
@@ -100,7 +109,10 @@ def get_case_or_404(case_id):
 
 def get_event_or_404(event_id):
     event = fetch_one(
-        '''SELECT e.*, c.code AS case_code, c.artifact_title, s.sampled_at, s.temperature,
+        '''SELECT e.*, c.code AS case_code,
+                  COALESCE(e.artifact_title, c.artifact_title) AS artifact_title,
+                  COALESCE(e.artifact_code, c.artifact_code) AS artifact_code,
+                  s.sampled_at, s.temperature,
                   s.humidity, s.co2_ppm, s.door_open
            FROM anomaly_events e JOIN display_cases c ON c.id=e.case_id
            JOIN environment_samples s ON s.id=e.sample_id WHERE e.id=%s''',
@@ -114,9 +126,11 @@ def get_event_or_404(event_id):
 @app.on_event('startup')
 def startup():
     wait_for_db()
+    exhibit_handover.ensure_schema()
     if os.getenv('SEED_DEMO', 'true').lower() == 'true':
         from scripts.seed_demo import main as seed_main
         seed_main()
+    exhibit_handover.backfill_attribution()
 
 
 @app.get('/health')
@@ -177,6 +191,7 @@ def create_case(payload: CasePayload, user=Depends(require_roles('operator', 'su
         )
     except Exception as exc:
         raise HTTPException(409, f'展柜编号已存在或数据不合法: {exc}') from exc
+    exhibit_handover.ensure_case_occupancy(row['id'])
     audit(user, 'create_case', 'display_case', row['id'], {'code': payload.code})
     return clean(row)
 
@@ -184,20 +199,68 @@ def create_case(payload: CasePayload, user=Depends(require_roles('operator', 'su
 @app.get('/cases/{case_id}')
 def case_detail(case_id: int, user=Depends(current_user)):
     case = get_case_or_404(case_id)
-    case['samples'] = fetch_all('SELECT * FROM environment_samples WHERE case_id=%s ORDER BY sampled_at DESC LIMIT 30', (case_id,))
+    case['samples'] = fetch_all(
+        '''SELECT s.*, o.artifact_code AS sample_artifact_code, o.artifact_title AS sample_artifact_title
+           FROM environment_samples s LEFT JOIN exhibit_occupancies o ON o.id=s.occupancy_id
+           WHERE s.case_id=%s ORDER BY s.sampled_at DESC LIMIT 30''', (case_id,)
+    )
     case['events'] = fetch_all(
-        '''SELECT e.*, s.sampled_at, s.temperature, s.humidity, s.co2_ppm, s.door_open
-           FROM anomaly_events e JOIN environment_samples s ON s.id=e.sample_id
+        '''SELECT e.*, COALESCE(e.artifact_title, c.artifact_title) AS artifact_title,
+                  s.sampled_at, s.temperature, s.humidity, s.co2_ppm, s.door_open
+           FROM anomaly_events e JOIN display_cases c ON c.id=e.case_id
+           JOIN environment_samples s ON s.id=e.sample_id
            WHERE e.case_id=%s ORDER BY e.created_at DESC''', (case_id,)
     )
     case['checks'] = fetch_all('SELECT * FROM artifact_checks WHERE case_id=%s ORDER BY checked_at DESC', (case_id,))
+    case['occupancies'] = fetch_all(
+        'SELECT * FROM exhibit_occupancies WHERE case_id=%s ORDER BY entered_at DESC', (case_id,)
+    )
+    case['training'] = exhibit_handover.training_status(case_id)
     return clean(case)
+
+
+@app.get('/exhibit-handovers')
+def handover_list(user=Depends(current_user)):
+    rows = fetch_all(
+        '''SELECT x.*, ca.code AS case_a_code, cb.code AS case_b_code,
+                  u.display_name AS confirmed_by_name
+           FROM exhibit_exchanges x
+           JOIN display_cases ca ON ca.id=x.case_a_id
+           JOIN display_cases cb ON cb.id=x.case_b_id
+           LEFT JOIN users u ON u.id=x.confirmed_by
+           ORDER BY x.handed_over_at DESC, x.id DESC LIMIT 50'''
+    )
+    return clean(rows)
+
+
+@app.post('/exhibit-handovers')
+def confirm_handover(payload: HandoverPayload, user=Depends(require_roles('supervisor'))):
+    # 未提供重试凭据时，用交接内容派生稳定键，保证网络重试不会重复登记。
+    request_key = payload.request_key or 'handover-{}-{}-{}'.format(
+        min(payload.case_a_id, payload.case_b_id),
+        max(payload.case_a_id, payload.case_b_id),
+        exhibit_handover.as_utc(payload.handed_over_at).isoformat(),
+    )
+    result = exhibit_handover.confirm_handover(
+        payload.case_a_id, payload.case_b_id, payload.handed_over_at, payload.note, request_key, user,
+    )
+    return clean(result)
+
+
+@app.get('/cases/{case_id}/training')
+def case_training(case_id: int, user=Depends(current_user)):
+    get_case_or_404(case_id)
+    return clean(exhibit_handover.training_status(case_id))
 
 
 @app.get('/samples')
 def samples(case_id: int | None = None, user=Depends(current_user)):
-    query = '''SELECT s.*, c.code AS case_code, c.artifact_title FROM environment_samples s
-               JOIN display_cases c ON c.id=s.case_id'''
+    query = '''SELECT s.*, c.code AS case_code,
+                      COALESCE(o.artifact_title, c.artifact_title) AS artifact_title,
+                      COALESCE(o.artifact_code, c.artifact_code) AS artifact_code
+               FROM environment_samples s
+               JOIN display_cases c ON c.id=s.case_id
+               LEFT JOIN exhibit_occupancies o ON o.id=s.occupancy_id'''
     params = ()
     if case_id:
         query += ' WHERE s.case_id=%s'
@@ -208,25 +271,18 @@ def samples(case_id: int | None = None, user=Depends(current_user)):
 
 @app.post('/samples')
 def create_sample(payload: SamplePayload, user=Depends(require_roles('operator', 'supervisor'))):
-    case = get_case_or_404(payload.case_id)
-    if case['status'] != 'active':
-        raise HTTPException(409, '停用或维护中的展柜不能接收采样')
     if not (0 <= payload.humidity <= 100 and -40 <= payload.temperature <= 80 and 0 <= payload.co2_ppm <= 10000):
         raise HTTPException(422, '采样值超出设备可测范围')
-    previous = fetch_one('SELECT sampled_at FROM environment_samples WHERE case_id=%s ORDER BY sampled_at DESC LIMIT 1', (payload.case_id,))
-    if previous and (payload.sampled_at - previous['sampled_at']).total_seconds() > 30 * 60:
-        raise HTTPException(422, '同一展柜采样间隔不能超过 30 分钟，请补齐缺测时段')
-    try:
-        row = execute_returning(
-            '''INSERT INTO environment_samples
-               (case_id, sampled_at, temperature, humidity, co2_ppm, door_open, source, state, note, created_by)
-               VALUES (%s,%s,%s,%s,%s,%s,'manual','accepted',%s,%s) RETURNING *''',
-            (payload.case_id, payload.sampled_at, payload.temperature, payload.humidity, payload.co2_ppm, payload.door_open, payload.note, user['id']),
-        )
-    except Exception as exc:
-        raise HTTPException(409, f'同一时间点已存在采样: {exc}') from exc
-    execute('UPDATE display_cases SET last_sample_at=%s WHERE id=%s', (payload.sampled_at, payload.case_id))
-    audit(user, 'create_sample', 'environment_sample', row['id'], {'case_id': payload.case_id, 'door_open': payload.door_open})
+    row, occupancy = exhibit_handover.create_sample_with_attribution(
+        payload.case_id, payload.sampled_at, payload.temperature, payload.humidity,
+        payload.co2_ppm, payload.door_open, payload.note, user['id'],
+    )
+    audit(user, 'create_sample', 'environment_sample', row['id'], {
+        'case_id': payload.case_id,
+        'door_open': payload.door_open,
+        'occupancy_id': row['occupancy_id'],
+        'artifact_code': occupancy['artifact_code'] if occupancy else None,
+    })
     return clean(row)
 
 
@@ -234,13 +290,17 @@ def create_sample(payload: SamplePayload, user=Depends(require_roles('operator',
 def analyze(case_id: int, user=Depends(require_roles('operator', 'supervisor'))):
     get_case_or_404(case_id)
     run_key = f'case-{case_id}-{uuid.uuid4().hex[:12]}'
-    row = execute_returning(
-        '''INSERT INTO algorithm_runs (run_key, case_id, status, input_summary, parameters)
-           VALUES (%s,%s,'queued',%s::jsonb,%s::jsonb) RETURNING *''',
-        (run_key, case_id, json.dumps({'case_id': case_id}), json.dumps({'random_state': 1069, 'contamination': 0.22, 'scaler': 'RobustScaler'})),
+    # 排队时快照当时展品：并发交接不会把本任务改判到新展品。
+    row = exhibit_handover.create_analysis_run(
+        case_id, run_key,
+        {'random_state': 1069, 'contamination': 0.22, 'scaler': 'RobustScaler'},
     )
     redis_client.rpush('museum_case_anomaly_jobs', json.dumps({'run_id': row['id'], 'case_id': case_id}))
-    audit(user, 'queue_analysis', 'algorithm_run', row['id'], {'case_id': case_id})
+    audit(user, 'queue_analysis', 'algorithm_run', row['id'], {
+        'case_id': case_id,
+        'occupancy_id': row['occupancy_id'],
+        'artifact_code': row['artifact_code'],
+    })
     return clean(row)
 
 
@@ -254,7 +314,10 @@ def run_detail(run_id: int, user=Depends(current_user)):
 
 @app.get('/anomalies')
 def anomalies(status: str | None = None, user=Depends(current_user)):
-    query = '''SELECT e.*, c.code AS case_code, c.artifact_title, s.sampled_at, s.temperature,
+    query = '''SELECT e.*, c.code AS case_code,
+                      COALESCE(e.artifact_title, c.artifact_title) AS artifact_title,
+                      COALESCE(e.artifact_code, c.artifact_code) AS artifact_code,
+                      s.sampled_at, s.temperature,
                       s.humidity, s.co2_ppm, s.door_open,
                       (SELECT COUNT(*) FROM duty_actions d WHERE d.event_id=e.id AND d.status='completed') AS completed_actions,
                       (SELECT COUNT(*) FROM artifact_checks a WHERE a.event_id=e.id AND a.result='pass') AS passed_checks

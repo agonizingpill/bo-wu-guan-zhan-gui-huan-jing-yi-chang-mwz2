@@ -13,7 +13,10 @@ SELECT c.code AS source_key,c.code AS subject,
        CONCAT(c.gallery,' · 有效样本 ',COUNT(s.sampled_at),' 条 · 最大间隔 ',COALESCE(ROUND(MAX(s.gap)/60,1),0),' 分钟') AS source_summary,
        CASE WHEN COUNT(s.sampled_at)>=2 AND MAX(s.gap)<=1800 THEN 'continuous' ELSE 'gap' END AS readiness
 FROM display_cases c LEFT JOIN (
-  SELECT case_id,sampled_at,EXTRACT(EPOCH FROM (sampled_at-LAG(sampled_at) OVER (PARTITION BY case_id ORDER BY sampled_at))) AS gap
+  SELECT case_id,sampled_at,occupancy_id,
+         CASE WHEN occupancy_id IS NOT DISTINCT FROM LAG(occupancy_id) OVER (PARTITION BY case_id ORDER BY sampled_at)
+              THEN EXTRACT(EPOCH FROM (sampled_at-LAG(sampled_at) OVER (PARTITION BY case_id ORDER BY sampled_at)))
+              ELSE NULL END AS gap
   FROM environment_samples WHERE state='accepted'
 ) s ON s.case_id=c.id WHERE c.status<>'retired' GROUP BY c.id
 """,
